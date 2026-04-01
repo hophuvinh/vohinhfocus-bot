@@ -1,513 +1,320 @@
-import os
-import json
-import logging
-import re
-import threading
+import os, asyncio, logging, httpx, re
 from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN", "")
-DATA_FILE = "tasks.json"
-PORT = int(os.environ.get("PORT", 8080))
+TOKEN    = os.environ["BOT_TOKEN"]
+CHAT_ID  = int(os.environ["CHAT_ID"])
+PORT     = int(os.environ.get("PORT", "8000"))
+API_BASE = f"http://localhost:{PORT}"
+APP_URL  = os.environ.get("APP_URL", "")
 
-# ===== DATA =====
-def load_tasks():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+def esc(text: str) -> str:
+    """Escape _ and * for Telegram Markdown"""
+    if not text: return ""
+    return text.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
 
-def save_tasks(tasks):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
+SLOT_LABEL   = {"focus-am":"🎯 Focus sáng","focus-pm":"🎯 Focus chiều","reactive-am":"⚡ Reactive sáng","reactive-pm":"⚡ Reactive chiều","learn-today":"◎ Tonight","inbox":"📥 Inbox"}
+STATUS_LABEL = {"todo":"Chưa làm","review":"Review","done":"✅ Xong"}
 
-def next_id(tasks):
-    return max((t["id"] for t in tasks), default=0) + 1
+# ═══ API ═══
+async def api_get(path):
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{API_BASE}{path}")
+        return r.json()
 
-# ===== WEB APP HTML =====
-WEB_APP_HTML = """<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
-<title>FocusFlow</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Bricolage+Grotesque:wght@400;500;600;800&display=swap" rel="stylesheet">
-<style>
-:root{--bg:#f5f2ec;--surface:#fff;--surface2:#edeae3;--border:#ddd9d0;--text:#1a1815;--muted:#8a8680;--accent:#d4521a;}
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-body{background:var(--bg);color:var(--text);font-family:"Bricolage Grotesque",sans-serif;min-height:100vh;padding-bottom:80px;}
-.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:1px solid var(--border);display:flex;z-index:100;padding-bottom:env(safe-area-inset-bottom);}
-.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;padding:10px 0 8px;gap:3px;cursor:pointer;font-size:10px;font-weight:600;color:var(--muted);letter-spacing:.5px;text-transform:uppercase;border:none;background:transparent;transition:color .15s;}
-.nav-item.active{color:var(--accent);}
-.nav-icon{font-size:20px;line-height:1;}
-.view{display:none;padding:16px;animation:fadeIn .2s ease;}
-.view.active{display:block;}
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-.view-title{font-size:20px;font-weight:800;letter-spacing:-.5px;margin-bottom:2px;}
-.view-sub{font-size:12px;color:var(--muted);font-family:"DM Mono",monospace;margin-bottom:16px;}
-.stats-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;}
-.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;display:flex;align-items:center;gap:10px;}
-.stat-icon{font-size:22px;}
-.stat-num{font-family:"DM Mono",monospace;font-size:24px;font-weight:500;line-height:1;}
-.stat-label{font-size:11px;color:var(--muted);}
-.section{margin-bottom:20px;}
-.section-label{font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:8px;}
-.section-label::after{content:"";flex:1;height:1px;background:var(--border);}
-.task-card{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border-radius:10px;border:1px solid var(--border);margin-bottom:8px;background:var(--surface);}
-.task-card.done{opacity:.4;}
-.task-check{width:20px;height:20px;border-radius:6px;border:1.5px solid var(--border);flex-shrink:0;margin-top:1px;display:flex;align-items:center;justify-content:center;background:var(--bg);cursor:pointer;font-size:12px;font-weight:700;}
-.task-check.checked{background:var(--accent);border-color:var(--accent);color:white;}
-.task-info{flex:1;min-width:0;}
-.task-name{font-size:14px;font-weight:500;line-height:1.3;margin-bottom:5px;}
-.task-card.done .task-name{text-decoration:line-through;}
-.task-meta{display:flex;gap:5px;flex-wrap:wrap;align-items:center;}
-.tag{font-size:10px;font-weight:600;padding:2px 7px;border-radius:4px;letter-spacing:.3px;text-transform:uppercase;}
-.tag-kv{background:#fde8dc;color:#d4521a;}.tag-uiux{background:#dceeff;color:#1a3a6b;}.tag-hr{background:#dcf0e4;color:#2d5a3d;}.tag-feedback{background:#f0e4f5;color:#7a2d5a;}.tag-boss{background:#1a1815;color:#f5f2ec;}
-.source-tag{font-family:"DM Mono",monospace;font-size:10px;color:var(--muted);}
-.deadline-tag{font-family:"DM Mono",monospace;font-size:10px;color:var(--muted);margin-left:auto;}
-.deadline-urgent{color:#d4521a;font-weight:700;}
-.move-row{display:flex;gap:6px;margin-top:8px;}
-.move-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--border);font-family:"Bricolage Grotesque",sans-serif;font-size:11px;font-weight:600;cursor:pointer;background:var(--bg);color:var(--muted);}
-.move-btn.active{background:var(--text);color:var(--bg);border-color:var(--text);}
-.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;color:var(--muted);font-size:13px;gap:8px;text-align:center;}
-.empty-icon{font-size:32px;opacity:.4;}
-.week-col{margin-bottom:16px;}
-.week-day-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-radius:8px;margin-bottom:6px;background:var(--surface2);font-size:12px;font-weight:700;}
-.week-day-header.today{background:var(--accent);color:white;}
-.week-day-date{font-family:"DM Mono",monospace;font-size:11px;opacity:.7;}
-.focus-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:70vh;text-align:center;padding:20px;}
-.focus-tag{font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:16px;}
-.focus-task{font-size:22px;font-weight:700;line-height:1.3;margin-bottom:40px;max-width:280px;}
-.focus-timer{font-family:"DM Mono",monospace;font-size:72px;font-weight:400;color:var(--accent);line-height:1;margin-bottom:32px;letter-spacing:-2px;}
-.focus-btns{display:flex;gap:12px;margin-bottom:24px;}
-.focus-btn{padding:12px 28px;border-radius:10px;border:none;font-family:"Bricolage Grotesque",sans-serif;font-size:14px;font-weight:700;cursor:pointer;}
-.btn-start{background:var(--accent);color:white;}.btn-reset{background:var(--surface2);color:var(--muted);}
-.focus-progress{width:100%;max-width:300px;height:3px;background:var(--border);border-radius:2px;overflow:hidden;}
-.focus-fill{height:100%;background:var(--accent);border-radius:2px;transition:width 1s linear;}
-.focus-select{width:100%;max-width:340px;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;}
-.focus-task-option{padding:12px 16px;display:flex;align-items:center;gap:10px;cursor:pointer;border-bottom:1px solid var(--border);}
-.focus-task-option:last-child{border-bottom:none;}
-.focus-task-option-name{font-size:13px;font-weight:500;}
-</style>
-</head>
-<body>
-<div id="view-daily" class="view active">
-  <div class="view-title">Hôm nay</div>
-  <div class="view-sub" id="dateStr"></div>
-  <div class="stats-row" id="statsRow"></div>
-  <div class="section"><div class="section-label">🎯 Deep Focus</div><div id="focusList"></div></div>
-  <div class="section"><div class="section-label">⚡ Reactive</div><div id="reactiveList"></div></div>
-</div>
-<div id="view-inbox" class="view">
-  <div class="view-title">Inbox</div>
-  <div class="view-sub">Chưa assign</div>
-  <div id="inboxList"></div>
-</div>
-<div id="view-weekly" class="view">
-  <div class="view-title">Tuần này</div>
-  <div class="view-sub" id="weekRange"></div>
-  <div id="weekList"></div>
-</div>
-<div id="view-focus" class="view">
-  <div id="focusModeWrap"></div>
-</div>
-<nav class="bottom-nav">
-  <button class="nav-item active" onclick="switchView('daily',this)"><span class="nav-icon">📅</span>Hôm nay</button>
-  <button class="nav-item" onclick="switchView('inbox',this)"><span class="nav-icon">📥</span>Inbox</button>
-  <button class="nav-item" onclick="switchView('weekly',this)"><span class="nav-icon">📆</span>Tuần</button>
-  <button class="nav-item" onclick="switchView('focus',this)"><span class="nav-icon">🎯</span>Focus</button>
-</nav>
-<script>
-const tg=window.Telegram?.WebApp;if(tg){tg.ready();tg.expand();}
-const TL={kv:"KV/Branding",uiux:"UI/UX",hr:"HR/Quy trình",feedback:"Feedback",boss:"Từ sếp"};
-const SL={editorial:"Editorial",sales:"Sales",boss:"Sếp",client:"Khách",self:"Cá nhân"};
-let tasks=[],timerInterval=null,timerSeconds=1500,timerRunning=false,totalSeconds=1500,currentFocusTask=null;
-async function loadTasks(){try{const r=await fetch('/api/tasks');tasks=await r.json();render();}catch(e){}}
-async function updateTask(id,changes){await fetch('/api/tasks/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});await loadTasks();}
-function getTodayStr(){return new Date().toISOString().split('T')[0];}
-function formatDate(s){if(!s)return'';const d=new Date(s+'T00:00:00');return d.getDate()+'/'+(d.getMonth()+1);}
-function isUrgent(dl){return dl&&dl<=getTodayStr();}
-function taskCard(t,showMove=false){
-  const u=isUrgent(t.deadline)&&!t.done;
-  return `<div class="task-card ${t.done?'done':''}">
-    <div class="task-check ${t.done?'checked':''}" onclick="toggleDone(${t.id})">${t.done?'✓':''}</div>
-    <div class="task-info">
-      <div class="task-name">${t.name}</div>
-      <div class="task-meta">
-        <span class="tag tag-${t.type}">${TL[t.type]||t.type}</span>
-        <span class="source-tag">${SL[t.source]||t.source}</span>
-        ${t.deadline?`<span class="deadline-tag ${u?'deadline-urgent':''}">${u?'🔴 ':''}${formatDate(t.deadline)}</span>`:''}
-      </div>
-      ${showMove?`<div class="move-row">
-        <button class="move-btn ${t.today==='focus'?'active':''}" onclick="moveTo(${t.id},'focus')">🎯 Focus</button>
-        <button class="move-btn ${t.today==='reactive'?'active':''}" onclick="moveTo(${t.id},'reactive')">⚡ Reactive</button>
-      </div>`:''}
-    </div>
-  </div>`;}
-function render(){
-  const now=new Date();
-  document.getElementById('dateStr').textContent=now.toLocaleDateString('vi-VN',{weekday:'long',day:'2-digit',month:'2-digit',year:'numeric'});
-  const focus=tasks.filter(t=>t.today==='focus'&&!t.done);
-  const reactive=tasks.filter(t=>t.today==='reactive'&&!t.done);
-  const inbox=tasks.filter(t=>t.today==='inbox'&&!t.done);
-  const done=tasks.filter(t=>t.done);
-  document.getElementById('statsRow').innerHTML=`
-    <div class="stat-card"><span class="stat-icon">🎯</span><div><div class="stat-num">${focus.length}</div><div class="stat-label">Deep focus</div></div></div>
-    <div class="stat-card"><span class="stat-icon">✅</span><div><div class="stat-num">${done.length}</div><div class="stat-label">Hoàn thành</div></div></div>`;
-  document.getElementById('focusList').innerHTML=focus.length?focus.map(t=>taskCard(t)).join(''):'<div class="empty"><div class="empty-icon">🎯</div>Chưa có task deep focus</div>';
-  document.getElementById('reactiveList').innerHTML=reactive.length?reactive.map(t=>taskCard(t)).join(''):'<div class="empty"><div class="empty-icon">⚡</div>Không có task reactive</div>';
-  document.getElementById('inboxList').innerHTML=inbox.length?inbox.map(t=>taskCard(t,true)).join(''):'<div class="empty"><div class="empty-icon">📥</div>Inbox trống 🎉</div>';
-  renderWeek();
-  if(!currentFocusTask)renderFocusSelect();
-}
-function renderWeek(){
-  const today=new Date(),monday=new Date(today);
-  monday.setDate(today.getDate()-today.getDay()+(today.getDay()===0?-6:1));
-  const days=['T2','T3','T4','T5','T6','T7','CN'];
-  const sunday=new Date(monday);sunday.setDate(monday.getDate()+6);
-  document.getElementById('weekRange').textContent=monday.getDate()+'/'+(monday.getMonth()+1)+' – '+sunday.getDate()+'/'+(sunday.getMonth()+1);
-  let html='';
-  for(let i=0;i<7;i++){
-    const d=new Date(monday);d.setDate(monday.getDate()+i);
-    const ds=d.toISOString().split('T')[0],isToday=ds===today.toISOString().split('T')[0];
-    const dt=tasks.filter(t=>t.deadline===ds&&!t.done);
-    html+=`<div class="week-col"><div class="week-day-header ${isToday?'today':''}"><span>${days[i]}</span><span class="week-day-date">${d.getDate()}/${d.getMonth()+1}${isToday?' — hôm nay':''}</span></div>${dt.length?dt.map(t=>taskCard(t)).join(''):'<div style="color:var(--muted);font-size:12px;padding:6px 4px">Trống</div>'}</div>`;
-  }
-  document.getElementById('weekList').innerHTML=html;
-}
-function renderFocusSelect(){
-  const ft=tasks.filter(t=>t.today==='focus'&&!t.done);
-  document.getElementById('focusModeWrap').innerHTML=ft.length?
-    `<div class="focus-wrap"><div class="focus-tag">CHỌN TASK ĐỂ BẮT ĐẦU</div><div class="focus-select">${ft.map(t=>`<div class="focus-task-option" onclick="startFocus(${t.id})"><span class="tag tag-${t.type}">${TL[t.type]}</span><span class="focus-task-option-name">${t.name}</span></div>`).join('')}</div></div>`:
-    `<div class="focus-wrap"><div class="empty-icon">🎯</div><div style="margin-top:12px;color:var(--muted);font-size:14px">Chưa có task deep focus.<br>Thêm qua Telegram bot nhé!</div></div>`;
-}
-function startFocus(id){
-  currentFocusTask=tasks.find(t=>t.id===id);
-  timerSeconds=1500;totalSeconds=1500;timerRunning=false;clearInterval(timerInterval);
-  document.getElementById('focusModeWrap').innerHTML=`<div class="focus-wrap">
-    <div class="focus-tag">${TL[currentFocusTask.type]}</div>
-    <div class="focus-task">${currentFocusTask.name}</div>
-    <div class="focus-timer" id="td">25:00</div>
-    <div class="focus-btns">
-      <button class="focus-btn btn-start" id="sb" onclick="toggleTimer()">▶ Bắt đầu</button>
-      <button class="focus-btn btn-reset" onclick="resetTimer()">↺ Reset</button>
-    </div>
-    <div class="focus-progress"><div class="focus-fill" id="tf" style="width:0%"></div></div>
-    <div style="margin-top:20px"><button class="move-btn" onclick="currentFocusTask=null;clearInterval(timerInterval);timerRunning=false;renderFocusSelect()">← Chọn task khác</button></div>
-  </div>`;}
-function toggleTimer(){
-  const btn=document.getElementById('sb');
-  if(timerRunning){clearInterval(timerInterval);timerRunning=false;btn.textContent='▶ Tiếp tục';}
-  else{timerRunning=true;btn.textContent='⏸ Tạm dừng';
-    timerInterval=setInterval(()=>{
-      timerSeconds--;
-      if(timerSeconds<=0){clearInterval(timerInterval);timerRunning=false;document.getElementById('td').textContent='00:00';document.getElementById('tf').style.width='100%';document.getElementById('sb').textContent='✓ Xong!';toggleDone(currentFocusTask.id);currentFocusTask=null;return;}
-      const m=Math.floor(timerSeconds/60),s=timerSeconds%60;
-      document.getElementById('td').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-      document.getElementById('tf').style.width=((totalSeconds-timerSeconds)/totalSeconds*100)+'%';
-    },1000);}
-}
-function resetTimer(){clearInterval(timerInterval);timerRunning=false;timerSeconds=1500;document.getElementById('td').textContent='25:00';document.getElementById('tf').style.width='0%';document.getElementById('sb').textContent='▶ Bắt đầu';}
-async function toggleDone(id){const t=tasks.find(t=>t.id===id);if(t)await updateTask(id,{done:!t.done});}
-async function moveTo(id,slot){
-  if(slot==='focus'&&tasks.filter(t=>t.today==='focus'&&!t.done&&t.id!==id).length>=3){alert('Tối đa 3 task Deep Focus!');return;}
-  await updateTask(id,{today:slot});
-}
-function switchView(name,btn){
-  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
-  document.getElementById('view-'+name).classList.add('active');btn.classList.add('active');
-}
-loadTasks();setInterval(loadTasks,30000);
-</script>
-</body>
-</html>"""
+async def api_post(path, data):
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(f"{API_BASE}{path}", json=data)
+        result = r.json()
+        logger.info(f"POST {path} status={r.status_code} -> {result}")
+        return result
 
-# ===== WEB SERVER =====
-class RequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
+async def api_patch(path, data):
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.patch(f"{API_BASE}{path}", json=data)
+        return r.json()
 
-    def do_GET(self):
-        if self.path in ['/', '/app']:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(WEB_APP_HTML.encode('utf-8'))
-        elif self.path == '/api/tasks':
-            data = json.dumps(load_tasks(), ensure_ascii=False)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(data.encode('utf-8'))
-        else:
-            self.send_response(404); self.end_headers()
+def fmt_date(s):
+    if not s: return ""
+    return datetime.strptime(s, "%Y-%m-%d").strftime("%-d/%-m")
 
-    def do_PATCH(self):
-        if self.path.startswith('/api/tasks/'):
-            task_id = int(self.path.split('/')[-1])
-            body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
-            tasks = load_tasks()
-            task = next((t for t in tasks if t['id'] == task_id), None)
-            if task:
-                task.update(body); save_tasks(tasks)
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps(task, ensure_ascii=False).encode())
-            else:
-                self.send_response(404); self.end_headers()
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, PATCH, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+def app_kb():
+    if not APP_URL: return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📱 Mở FocusFlow", url=APP_URL)]])
 
-def run_web_server():
-    server = HTTPServer(('0.0.0.0', PORT), RequestHandler)
-    logger.info(f"Web server on port {PORT}")
-    server.serve_forever()
+def slot_kb(task_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎯 Sáng",  callback_data=f"slot_{task_id}_focus-am"),
+        InlineKeyboardButton("🎯 Chiều", callback_data=f"slot_{task_id}_focus-pm"),
+        InlineKeyboardButton("⚡ Reactive", callback_data=f"slot_{task_id}_reactive-am"),
+        InlineKeyboardButton("◎ Learn",     callback_data=f"slot_{task_id}_learn-today"),
+    ]])
 
-# ===== NLP =====
-TYPE_KEYWORDS = {
-    "kv": ["kv","key visual","concept","branding","brand","logo","nhận diện"],
-    "uiux": ["ui","ux","giao diện","interface","trang","web","layout","wireframe"],
-    "hr": ["nhân sự","quy trình","hr","team","tuyển","onboard","cải tiến","improve"],
-    "feedback": ["feedback","review","approve","duyệt","check","sửa","chỉnh"],
-    "boss": ["sếp","boss","anh","chị giao","yêu cầu gấp"],
-}
-SOURCE_KEYWORDS = {
-    "editorial": ["editorial","biên tập","ban biên","trang tin","news","bài"],
-    "sales": ["sales","kinh doanh","khách chốt","chốt tiền","proposal"],
-    "boss": ["sếp","boss","giám đốc"],
-    "client": ["khách hàng","client","agency","đối tác","samsung","honda"],
-    "self": ["cá nhân","tự làm","mình cần"],
-}
-URGENCY_PATTERNS = [
-    (r"hôm nay|today|ngay bây giờ|gấp|urgent", 0),
-    (r"ngày mai|tomorrow|mai", 1),
-    (r"tuần này|this week", 3),
-    (r"(\d+)\s*ngày", None),
-]
-
-def parse_task(text):
-    tl = text.lower()
-    task_type = next((t for t, kws in TYPE_KEYWORDS.items() if any(k in tl for k in kws)), "kv")
-    source = next((s for s, kws in SOURCE_KEYWORDS.items() if any(k in tl for k in kws)), "self")
-    deadline = None
-    today = datetime.now()
-    for pattern, delta in URGENCY_PATTERNS:
-        m = re.search(pattern, tl)
-        if m:
-            days = int(m.group(1)) if delta is None else delta
-            deadline = (today + timedelta(days=days)).strftime("%Y-%m-%d")
-            break
-    if not deadline: deadline = today.strftime("%Y-%m-%d")
-    today_slot = "focus" if task_type in ["kv","uiux","hr"] else "reactive"
-    name = text.strip()
-    for f in ["hôm nay cần làm","cần làm","hôm nay","tôi cần","mình cần"]:
-        if name.lower().startswith(f): name = name[len(f):].strip(); break
-    name = name[:1].upper()+name[1:] if name else text
-    return {"type":task_type,"source":source,"deadline":deadline,"today":today_slot,"name":name}
-
-TYPE_LABELS = {"kv":"KV/Branding","uiux":"UI/UX","hr":"HR/Quy trình","feedback":"Feedback","boss":"Từ sếp"}
-SOURCE_LABELS = {"editorial":"Editorial","sales":"Sales","boss":"Sếp","client":"Khách hàng","self":"Cá nhân"}
-TODAY_LABELS = {"focus":"🎯 Deep Focus","reactive":"⚡ Reactive","inbox":"📥 Inbox"}
-DONE_KW = ["xong","done","hoàn thành","xong rồi","làm xong","ok xong","finish","completed","xog"]
-
-def is_done(text): return any(k in text.lower() for k in DONE_KW)
-
-def similarity(a, b):
-    a,b = a.lower(),b.lower()
-    if a==b: return 1.0
-    wa,wb = set(a.split()),set(b.split())
-    if not wa or not wb: return 0.0
-    return len(wa&wb)/max(len(wa),len(wb))
-
-def find_dup(name, tasks):
-    return next((t for t in tasks if not t.get("done") and similarity(name,t["name"])>=0.7), None)
-
-def get_webapp_url():
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_STATIC_URL")
-    return f"https://{domain}/app" if domain else None
-
-# ===== BOT HANDLERS =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = get_webapp_url()
-    kb = [[InlineKeyboardButton("📋 Mở FocusFlow", web_app=WebAppInfo(url=url))]] if url else []
-    await update.message.reply_text(
-        "👋 Chào Vinh!\n\nNhắn tự nhiên để thêm task:\n\n"
-        "💬 *Ví dụ:*\n• _Hôm nay làm KV cho Better Choice_\n• _Feedback banner editorial gấp_\n• _Sếp giao proposal Samsung ngày mai_\n\n"
-        "📋 /today /inbox /week /done /app",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-
-async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = get_webapp_url()
-    if not url:
-        await update.message.reply_text("⚠️ Cần set RAILWAY_PUBLIC_DOMAIN trong Variables")
-        return
-    await update.message.reply_text("Mở FocusFlow 👇",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 FocusFlow", web_app=WebAppInfo(url=url))]]))
-
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks(); url = get_webapp_url()
-    focus = [t for t in tasks if t.get("today")=="focus" and not t.get("done")]
-    reactive = [t for t in tasks if t.get("today")=="reactive" and not t.get("done")]
-    done = [t for t in tasks if t.get("done")]
-    msg = f"📅 *{datetime.now().strftime('%d/%m/%Y')}*\n\n🎯 *Focus ({len(focus)}/3)*\n"
-    msg += "".join(f"  • {t['name']}\n" for t in focus) or "  _Chưa có_\n"
-    msg += f"\n⚡ *Reactive ({len(reactive)})*\n"
-    msg += "".join(f"  • {t['name']}\n" for t in reactive) or "  _Trống_\n"
-    if done: msg += f"\n✅ *Xong ({len(done)})*\n" + "".join(f"  ~~{t['name']}~~\n" for t in done[-3:])
-    kb = [[InlineKeyboardButton("📋 Xem FocusFlow", web_app=WebAppInfo(url=url))]] if url else []
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-
-async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks(); url = get_webapp_url()
-    inbox = [t for t in tasks if t.get("today")=="inbox" and not t.get("done")]
-    if not inbox:
-        await update.message.reply_text("📥 Inbox trống 🎉"); return
-    msg = f"📥 *Inbox ({len(inbox)})*\n\n"
-    for t in inbox:
-        dl = f" — {datetime.strptime(t['deadline'],'%Y-%m-%d').strftime('%d/%m')}" if t.get("deadline") else ""
-        msg += f"• [{t['id']}] {t['name']}{dl}\n"
-    msg += "\n_/move [id] focus để assign_"
-    kb = [[InlineKeyboardButton("📋 Xem FocusFlow", web_app=WebAppInfo(url=url))]] if url else []
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-
-async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks(); today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
-    days_vi = ["T2","T3","T4","T5","T6","T7","CN"]
-    msg = "📆 *Tuần này*\n\n"
-    for i in range(7):
-        day = monday + timedelta(days=i); ds = day.strftime("%Y-%m-%d")
-        dt = [t for t in tasks if t.get("deadline")==ds and not t.get("done")]
-        is_today = ds==today.strftime("%Y-%m-%d")
-        if dt or is_today:
-            msg += f"*{days_vi[i]} {day.strftime('%d/%m')}*{' ◀' if is_today else ''}\n"
-            msg += "".join(f"  • {t['name']}\n" for t in dt) or "  _Trống_\n"
-            msg += "\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = load_tasks()
-    active = [t for t in tasks if not t.get("done") and t.get("today") in ["focus","reactive"]]
-    if not active:
-        await update.message.reply_text("Không có task active!"); return
-    kb = [[InlineKeyboardButton(f"✓ {t['name'][:45]}", callback_data=f"done_{t['id']}")] for t in active]
-    await update.message.reply_text("Task nào xong?", reply_markup=InlineKeyboardMarkup(kb))
-
-async def move_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Cú pháp: `/move [id] focus`", parse_mode="Markdown"); return
+# ═══ SCHEDULED ═══
+async def morning_nudge(bot: Bot):
+    now = datetime.now()
+    day_vi = ["Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6","Thứ 7","Chủ nhật"][now.weekday()]
     try:
-        task_id=int(args[0]); slot=args[1].lower(); assert slot in ["focus","reactive","inbox"]
-    except:
-        await update.message.reply_text("❌ Ví dụ: `/move 3 focus`", parse_mode="Markdown"); return
-    tasks = load_tasks()
-    task = next((t for t in tasks if t["id"]==task_id), None)
-    if not task:
-        await update.message.reply_text(f"❌ Không tìm thấy #{task_id}"); return
-    if slot=="focus" and sum(1 for t in tasks if t.get("today")=="focus" and not t.get("done"))>=3:
-        await update.message.reply_text("⚠️ Tối đa 3 task Focus/ngày!"); return
-    task["today"]=slot; save_tasks(tasks)
-    await update.message.reply_text(f"✅ *{task['name']}*\n→ {TODAY_LABELS[slot]}", parse_mode="Markdown")
+        s = await api_get("/api/summary")
+        focus = s.get("focus", [])
+        msg = f"☀️ *Chào buổi sáng, Vinh!*\n_{day_vi}, {now.strftime('%d/%m/%Y')}_\n\n"
+        if focus:
+            msg += f"🎯 *Focus hôm nay ({len(focus)}/3):*\n" + "".join(f"  • {t['name']}\n" for t in focus)
+        else:
+            msg += "🎯 Focus trống — vào app xếp task!\n"
+        msg += "\n👉 Mở app bắt đầu ngày mới"
+        await bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=app_kb())
+    except Exception as e:
+        logger.error(f"morning_nudge: {e}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text: return
-    if update.message.chat.type in ["group","supergroup"]:
-        bot_username = context.bot.username
-        if f"@{bot_username}" not in text: return
-        text = text.replace(f"@{bot_username}","").strip()
-        if not text:
-            await update.message.reply_text("Nhắn gì đi 😄"); return
+async def reactive_nudge(bot: Bot):
+    try:
+        s = await api_get("/api/summary")
+        reactive = s.get("reactive", [])
+        overdue  = s.get("overdue", [])
+        msg = "⚡ *Reactive chiều — 16:00*\n\n"
+        if reactive:
+            msg += f"*Task cần xử lý ({len(reactive)}):*\n" + "".join(f"  • {t['name']}\n" for t in reactive)
+        else:
+            msg += "Không có task reactive 🎉\n"
+        if overdue:
+            msg += "\n🔴 *Quá hạn:*\n" + "".join(f"  • {t['name']} _(hạn {fmt_date(t['deadline'])})_\n" for t in overdue)
+        await bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=app_kb())
+    except Exception as e:
+        logger.error(f"reactive_nudge: {e}")
 
-    tasks = load_tasks(); url = get_webapp_url()
+async def delegation_check(bot: Bot):
+    try:
+        s = await api_get("/api/summary")
+        delegated = s.get("delegated", [])
+        urgent    = s.get("urgent_delegated", [])
+        if not delegated: return
+        msg = "👀 *Check task đã giao — 17:00*\n\n"
+        if urgent:
+            msg += "🔴 *Sắp đến hạn:*\n" + "".join(
+                f"  • {t['name']} — {t['who']} _(hạn {fmt_date(t['deadline'])})_\n" for t in urgent) + "\n"
+        uid = {t['id'] for t in urgent}
+        watching = [t for t in delegated if t['id'] not in uid]
+        if watching:
+            msg += f"👁 *Đang theo dõi ({len(watching)}):*\n"
+            for t in watching[:5]:
+                dl = f" _(hạn {fmt_date(t['deadline'])})_" if t.get("deadline") else ""
+                msg += f"  • {t['name']} — {t['who']}{dl}\n"
+        await bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=app_kb())
+    except Exception as e:
+        logger.error(f"delegation_check: {e}")
 
-    if is_done(text):
-        active = [t for t in tasks if not t.get("done") and t.get("today") in ["focus","reactive"]]
-        if not active:
-            await update.message.reply_text("Không có task active!"); return
-        kb = [[InlineKeyboardButton(f"✓ {t['name'][:45]}", callback_data=f"done_{t['id']}")] for t in active]
-        await update.message.reply_text("Task nào xong rồi?", reply_markup=InlineKeyboardMarkup(kb)); return
+async def eod_summary(bot: Bot):
+    try:
+        s = await api_get("/api/summary")
+        done     = s.get("done_today", [])
+        focus    = s.get("focus", [])
+        reactive = s.get("reactive", [])
+        msg = "🌙 *Tổng kết ngày*\n\n"
+        if done:
+            msg += f"✅ *Đã xong ({len(done)}):*\n" + "".join(f"  • {n}\n" for n in done)
+        else:
+            msg += "Chưa đánh dấu xong task nào.\n"
+        remaining = focus + reactive
+        if remaining:
+            msg += f"\n⏳ *Còn lại ({len(remaining)}):*\n" + "".join(f"  • {t['name']}\n" for t in remaining)
+        msg += "\n_Nghỉ ngơi tốt nhé! 💤_"
+        await bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=app_kb())
+    except Exception as e:
+        logger.error(f"eod_summary: {e}")
 
-    parsed = parse_task(text)
-    dup = find_dup(parsed["name"], tasks)
-    if dup:
-        kb = [[InlineKeyboardButton("✅ Đánh dấu xong", callback_data=f"done_{dup['id']}"),
-               InlineKeyboardButton("➕ Tạo mới", callback_data=f"force_new_{parsed['name'][:50]}")]]
-        await update.message.reply_text(
-            f"⚠️ *Giống task đang có:*\n• #{dup['id']} {dup['name']} _[{TODAY_LABELS.get(dup['today'])}]_\n\nBạn muốn?",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)); return
+# ═══ HANDLE UPDATE ═══
+async def handle_update(bot: Bot, update_data: dict):
+    chat_id = None
+    try:
+        # Extract chat_id early for error handling
+        if "message" in update_data:
+            chat_id = update_data["message"]["chat"]["id"]
+        elif "callback_query" in update_data:
+            chat_id = update_data["callback_query"]["message"]["chat"]["id"]
 
-    if parsed["today"]=="focus" and sum(1 for t in tasks if t.get("today")=="focus" and not t.get("done"))>=3:
-        parsed["today"]="inbox"
+        # ── CALLBACK ──
+        if "callback_query" in update_data:
+            cq   = update_data["callback_query"]
+            d    = cq["data"]
+            mid  = cq["message"]["message_id"]
+            await bot.answer_callback_query(cq["id"])
 
-    task = {"id":next_id(tasks),"name":parsed["name"],"type":parsed["type"],"source":parsed["source"],
-            "deadline":parsed["deadline"],"today":parsed["today"],"done":False,"created_at":datetime.now().isoformat()}
-    tasks.insert(0,task); save_tasks(tasks)
+            if d.startswith("task_done_"):
+                tid  = int(d.split("_")[-1])
+                task = await api_patch(f"/api/tasks/{tid}", {"done": True, "status": "done"})
+                await bot.edit_message_text(f"✅ {esc(task['name'])} 🎉", chat_id, mid, parse_mode="Markdown")
 
-    dl = datetime.strptime(task["deadline"],"%Y-%m-%d").strftime("%d/%m/%Y")
-    btn_row = [InlineKeyboardButton("🎯",callback_data=f"move_{task['id']}_focus"),
-               InlineKeyboardButton("⚡",callback_data=f"move_{task['id']}_reactive"),
-               InlineKeyboardButton("📥",callback_data=f"move_{task['id']}_inbox")]
-    kb = [btn_row]
-    if url: kb.append([InlineKeyboardButton("📋 Xem FocusFlow", web_app=WebAppInfo(url=url))])
+            elif d.startswith("slot_"):
+                _, tid, slot = d.split("_", 2)
+                if slot in ["focus-am","focus-pm"]:
+                    tasks = await api_get("/api/tasks")
+                    focus_count = sum(1 for t in tasks if t["slot"] in ["focus-am","focus-pm"] and not t["done"] and str(t["id"]) != tid)
+                    if focus_count >= 3:
+                        await bot.answer_callback_query(cq["id"], "⚠️ Tối đa 3 task Focus mỗi ngày!", show_alert=True)
+                        return
+                task = await api_patch(f"/api/tasks/{tid}", {"slot": slot, "assigned_date": today_str()})
+                await bot.edit_message_text(
+                    f"✅ *#{task['id']}* {esc(task['name'])}\n→ {SLOT_LABEL.get(slot, slot)}",
+                    chat_id, mid, parse_mode="Markdown")
 
-    await update.message.reply_text(
-        f"✅ *#{task['id']}* {task['name']}\n\n• {TYPE_LABELS[task['type']]} · {SOURCE_LABELS[task['source']]} · {dl}\n• {TODAY_LABELS[task['today']]}",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+            elif d.startswith("delg_done_"):
+                tid = int(d.split("_")[-1])
+                await api_patch(f"/api/delegated/{tid}", {"status": "done"})
+                await bot.edit_message_text("✅ Đánh dấu xong!", chat_id, mid)
+            return
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    data = query.data; tasks = load_tasks()
+        # ── MESSAGE ──
+        if "message" not in update_data: return
+        msg  = update_data["message"]
+        text = msg.get("text", "").strip()
+        if not text: return
 
-    if data.startswith("done_"):
-        task = next((t for t in tasks if t["id"]==int(data.split("_")[1])),None)
-        if task:
-            task["done"]=True; save_tasks(tasks)
-            await query.edit_message_text(f"✅ Xong! *{task['name']}* 🎉", parse_mode="Markdown")
+        if text.startswith("/start"):
+            await bot.send_message(chat_id,
+                "👋 *FocusFlow Bot*\n\nNhắn tên task để thêm.\n\n"
+                "/today · /reactive · /delegated · /done\n/add [tên] · /finish",
+                parse_mode="Markdown", reply_markup=app_kb())
 
-    elif data.startswith("force_new_"):
-        name = data.replace("force_new_",""); parsed = parse_task(name)
-        task = {"id":next_id(tasks),"name":name,"type":parsed["type"],"source":parsed["source"],
-                "deadline":parsed["deadline"],"today":parsed["today"],"done":False,"created_at":datetime.now().isoformat()}
-        tasks.insert(0,task); save_tasks(tasks)
-        await query.edit_message_text(f"✅ *Tạo mới #{task['id']}*\n📌 {task['name']}", parse_mode="Markdown")
+        elif text.startswith("/today"):
+            s = await api_get("/api/summary")
+            focus    = s.get("focus", [])
+            reactive = s.get("reactive", [])
+            m  = f"📅 *Hôm nay — {datetime.now().strftime('%d/%m')}*\n\n"
+            m += f"🎯 *Focus ({len(focus)}/3):*\n"
+            m += "".join(f"  `#{t['id']}` {t['name']} — _{STATUS_LABEL.get(t['status'],'')}_\n" for t in focus) or "  _Trống_\n"
+            m += f"\n⚡ *Reactive ({len(reactive)}):*\n"
+            m += "".join(f"  `#{t['id']}` {t['name']}\n" for t in reactive) or "  _Trống_\n"
+            await bot.send_message(chat_id, m, parse_mode="Markdown", reply_markup=app_kb())
 
-    elif data.startswith("move_"):
-        parts = data.split("_"); task_id=int(parts[1]); slot=parts[2]
-        task = next((t for t in tasks if t["id"]==task_id),None)
-        if task:
-            if slot=="focus" and sum(1 for t in tasks if t.get("today")=="focus" and not t.get("done") and t["id"]!=task_id)>=3:
-                await query.answer("⚠️ Tối đa 3 task Focus/ngày!",show_alert=True); return
-            task["today"]=slot; save_tasks(tasks)
-            await query.edit_message_text(f"✅ *{task['name']}*\n→ {TODAY_LABELS[slot]}", parse_mode="Markdown")
+        elif text.startswith("/reactive"):
+            tasks = await api_get("/api/tasks")
+            r = [t for t in tasks if t["slot"] in ["reactive-am","reactive-pm"] and not t["done"]]
+            m = f"⚡ *Reactive ({len(r)}):*\n\n" + "".join(f"`#{t['id']}` {t['name']}\n" for t in r) if r else "Không có task reactive"
+            await bot.send_message(chat_id, m, parse_mode="Markdown")
 
-# ===== MAIN =====
-def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
-    for cmd, handler in [("start",start),("app",app_command),("today",today_command),
-                          ("inbox",inbox_command),("week",week_command),("done",done_command),("move",move_command)]:
-        app.add_handler(CommandHandler(cmd, handler))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("FocusFlow started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+        elif text.startswith("/delegated"):
+            items    = await api_get("/api/delegated")
+            watching = [t for t in items if t["status"] == "watching"]
+            if not watching:
+                await bot.send_message(chat_id, "Không có task đang theo dõi"); return
+            m = f"👀 *Đã giao ({len(watching)}):*\n\n"
+            for t in watching:
+                urgent = t.get("deadline", "") <= today_str() if t.get("deadline") else False
+                dl = f" · hạn {fmt_date(t['deadline'])}" if t.get("deadline") else ""
+                m += f"{'🔴 ' if urgent else ''}`#{t['id']}` {t['name']} — *{t.get('who','')}*{dl}\n"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✓ #{t['id']} xong", callback_data=f"delg_done_{t['id']}")] for t in watching[:3]])
+            await bot.send_message(chat_id, m, parse_mode="Markdown", reply_markup=kb)
 
-if __name__=="__main__":
-    main()
+        elif text.startswith("/done"):
+            s = await api_get("/api/summary")
+            done     = s.get("done_today", [])
+            focus    = s.get("focus", [])
+            reactive = s.get("reactive", [])
+            m = f"🌙 *{datetime.now().strftime('%d/%m')}* — Xong: *{len(done)}* · Còn: *{len(focus)+len(reactive)}*\n"
+            if done: m += "\n" + "".join(f"  ✅ {n}\n" for n in done[-5:])
+            await bot.send_message(chat_id, m, parse_mode="Markdown")
+
+        elif text.lower().startswith("/add"):
+            name = text[4:].strip()
+            if not name:
+                await bot.send_message(chat_id, "Cú pháp: `/add tên task`", parse_mode="Markdown"); return
+            task = await api_post("/api/tasks", {"name": name, "slot": "inbox"})
+            if "id" not in task:
+                await bot.send_message(chat_id, f"❌ Lỗi tạo task: {task}"); return
+            await bot.send_message(chat_id, f"✅ *#{task['id']}* {esc(task['name'])}\n_Chọn slot:_",
+                parse_mode="Markdown", reply_markup=slot_kb(task['id']))
+
+        elif text.lower().startswith("/finish"):
+            parts = text.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                task = await api_patch(f"/api/tasks/{parts[1]}", {"done": True, "status": "done"})
+                await bot.send_message(chat_id, f"✅ {esc(task['name'])} 🎉", parse_mode="Markdown")
+            else:
+                tasks  = await api_get("/api/tasks")
+                active = [t for t in tasks if not t["done"] and t["slot"] in ["focus-am","focus-pm","reactive-am","reactive-pm"]]
+                if not active:
+                    await bot.send_message(chat_id, "Không có task đang active"); return
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✓ #{t['id']} {t['name'][:35]}", callback_data=f"task_done_{t['id']}")] for t in active])
+                await bot.send_message(chat_id, "Task nào xong?", reply_markup=kb)
+
+        else:
+            # "xong #5" hoặc "done 5"
+            match = re.match(r"(?:xong|done)\s+#?(\d+)", text, re.I)
+            if match:
+                task = await api_patch(f"/api/tasks/{match.group(1)}", {"done": True, "status": "done"})
+                await bot.send_message(chat_id, f"✅ {esc(task['name'])} 🎉", parse_mode="Markdown")
+            else:
+                # free text = new task
+                task = await api_post("/api/tasks", {"name": text, "slot": "inbox"})
+                if "id" not in task:
+                    await bot.send_message(chat_id, f"❌ Lỗi tạo task: {task}"); return
+                await bot.send_message(chat_id, f"✅ *#{task['id']}* {esc(task['name'])}\n_Chọn slot:_",
+                    parse_mode="Markdown", reply_markup=slot_kb(task['id']))
+
+    except Exception as e:
+        logger.error(f"handle_update error: {e}", exc_info=True)
+        if chat_id:
+            try: await bot.send_message(chat_id, f"❌ Lỗi: {e}")
+            except: pass
+
+# ═══ SCHEDULER ═══
+async def run_scheduler(bot: Bot):
+    sent = set()
+    while True:
+        vn_now = datetime.utcnow() + timedelta(hours=7)
+        key    = vn_now.strftime("%H:%M")
+        if key == "00:00": sent.clear()
+
+        jobs = {"08:20": morning_nudge, "16:00": reactive_nudge,
+                "17:00": delegation_check, "21:00": eod_summary}
+        if key in jobs and key not in sent:
+            sent.add(key)
+            asyncio.create_task(jobs[key](bot))
+
+        await asyncio.sleep(30)
+
+# ═══ POLLING ═══
+async def run_polling(bot: Bot):
+    offset = None
+    logger.info("FocusFlow Bot polling started ✅")
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
+            if offset: params["offset"] = offset
+            updates = await bot.get_updates(**params)
+            for u in updates:
+                offset = u.update_id + 1
+                asyncio.create_task(handle_update(bot, u.to_dict()))
+        except Exception as e:
+            logger.error(f"polling error: {e}")
+            await asyncio.sleep(5)
+
+# ═══ MAIN ═══
+async def main():
+    # Wait for API to be ready
+    for _ in range(10):
+        try:
+            async with httpx.AsyncClient(timeout=3) as c:
+                await c.get(f"{API_BASE}/health")
+            logger.info(f"API ready at {API_BASE} ✅")
+            break
+        except:
+            logger.info("Waiting for API...")
+            await asyncio.sleep(2)
+
+    request = HTTPXRequest(connection_pool_size=8)
+    bot     = Bot(token=TOKEN, request=request)
+    me      = await bot.get_me()
+    logger.info(f"Bot: @{me.username} ✅")
+    await asyncio.gather(run_polling(bot), run_scheduler(bot))
+
+if __name__ == "__main__":
+    asyncio.run(main())
